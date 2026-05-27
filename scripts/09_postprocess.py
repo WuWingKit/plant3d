@@ -101,81 +101,74 @@ def step_voxel(pcd, voxel_size=2.0):
     return pcd_down
 
 
-def step_upsample(pcd, voxel_size=1.0, points_per_voxel=3, color_k=8):
+def step_upsample(pcd, neighbor_k=6, color_k=8, jitter=0.1):
     """
-    上采样：在每个体素内插值新点，增加点云密度。
+    上采样：在每对近邻之间插值中点，增加点云密度。
 
     原理：
-    1. 对每个体素内的点，计算质心
-    2. 在质心附近随机生成新点（沿法向量方向偏移）
-    3. 新点颜色 = 附近 K 个原有点的颜色均值
+    1. 对每个点找 K 个最近邻
+    2. 在每对相邻点的中点处生成新点
+    3. 沿法向量方向加微小随机偏移（避免共面）
+    4. 新点颜色 = 附近 color_k 个原有点的颜色均值
+    5. 用去重避免 A-B 和 B-A 生成重复中点
 
-    voxel_size: 体素尺寸 mm（越小插值点越多）
-    points_per_voxel: 每个体素插值的点数（默认 3）
+    neighbor_k: 每个点的近邻数（默认 6，生成点数约 N×K/2）
     color_k: 颜色插值时取最近 K 个点的均值（默认 8）
+    jitter: 法向量随机偏移比例（0.1 = 距离的 10%）
     """
     n_before = len(pcd.points)
 
-    # 计算法向量（用于插值方向）
+    # 计算法向量
     pcd.estimate_normals(
-        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+        o3d.geometry.KDTreeSearchParamHybrid(radius=5.0, max_nn=30))
 
-    # 获取数据
     pts = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors) if len(np.asarray(pcd.colors)) > 0 else None
     normals = np.asarray(pcd.normals) if len(np.asarray(pcd.normals)) > 0 else None
 
-    # 建 KD 树用于颜色查询
-    color_tree = None
-    if colors is not None:
-        color_tree = o3d.geometry.KDTreeFlann(pcd)
+    # 建 KD 树
+    tree = o3d.geometry.KDTreeFlann(pcd)
 
-    # 计算每个点所属的体素索引
-    origin = pts.min(axis=0)
-    voxel_indices = {}
-    for i, pt in enumerate(pts):
-        voxel_idx = tuple(((pt - origin) / voxel_size).astype(int))
-        if voxel_idx not in voxel_indices:
-            voxel_indices[voxel_idx] = []
-        voxel_indices[voxel_idx].append(i)
-
-    # 在每个体素内插值新点
+    # 记录已生成的边，避免重复（用 (min_idx, max_idx) 作为 key）
+    seen_edges = set()
     new_points = []
     new_colors = []
-    n_voxels_with_points = 0
 
-    for voxel_idx, point_indices in voxel_indices.items():
-        if len(point_indices) < 2:
-            continue
+    for i in range(n_before):
+        # 找 neighbor_k+1 个近邻（包含自身）
+        _, idx, dist = tree.search_knn_vector_3d(pcd.points[i], neighbor_k + 1)
+        idx = np.asarray(idx)
+        dist = np.asarray(dist)
 
-        n_voxels_with_points += 1
+        for j in range(1, len(idx)):  # 跳过自身 (idx[0] == i)
+            ni = idx[j]
+            edge = (min(i, ni), max(i, ni))
+            if edge in seen_edges:
+                continue
+            seen_edges.add(edge)
 
-        # 获取体素内的点
-        voxel_pts = pts[point_indices]
-        centroid = voxel_pts.mean(axis=0)
+            # 中点
+            mid = (pts[i] + pts[ni]) / 2.0
 
-        # 计算体素内点的标准差（用于控制插值范围）
-        std = voxel_pts.std(axis=0).mean()
+            # 沿法向量方向加微小偏移
+            if normals is not None:
+                avg_normal = (normals[i] + normals[ni]) / 2.0
+                norm_len = np.linalg.norm(avg_normal)
+                if norm_len > 1e-8:
+                    avg_normal /= norm_len
+                    d = np.sqrt(dist[j])  # 近邻距离
+                    offset = np.random.uniform(-jitter * d, jitter * d)
+                    mid = mid + offset * avg_normal
 
-        # 在质心附近生成新点（沿法向量方向）
-        if normals is not None:
-            voxel_normals = normals[point_indices]
-            avg_normal = voxel_normals.mean(axis=0)
-            avg_normal = avg_normal / np.linalg.norm(avg_normal)
+            new_points.append(mid)
 
-            # 在法向量方向上插值
-            for _ in range(points_per_voxel):
-                offset = np.random.uniform(-std, std)
-                new_pt = centroid + offset * avg_normal
-                new_points.append(new_pt)
+            # 颜色：取最近 color_k 个原有点的均值
+            if colors is not None:
+                _, cidx, _ = tree.search_knn_vector_3d(mid, color_k)
+                avg_color = colors[np.asarray(cidx)].mean(axis=0)
+                new_colors.append(avg_color)
 
-                # 颜色：取最近 K 个原有点的颜色均值
-                if color_tree is not None:
-                    _, idx, _ = color_tree.search_knn_vector_3d(new_pt, color_k)
-                    avg_color = colors[np.asarray(idx)].mean(axis=0)
-                    new_colors.append(avg_color)
-
-    # 合并新点和原有点
+    # 合并
     if new_points:
         all_points = np.vstack([pts, np.array(new_points)])
         if colors is not None and new_colors:
@@ -194,9 +187,8 @@ def step_upsample(pcd, voxel_size=1.0, points_per_voxel=3, color_k=8):
         pcd_upsampled = pcd
 
     n_after = len(pcd_upsampled.points)
-    print(f"  上采样 (voxel={voxel_size}mm, {points_per_voxel}点/体素, color_k={color_k}): "
+    print(f"  上采样 (neighbor_k={neighbor_k}, color_k={color_k}, jitter={jitter}): "
           f"{n_before:,} → {n_after:,} 点 (+{n_after-n_before:,})")
-    print(f"  有效体素: {n_voxels_with_points:,}")
     return pcd_upsampled
 
 
@@ -383,11 +375,13 @@ def main():
 
     # 上采样参数
     parser.add_argument("--upsample", action="store_true",
-                        help="启用上采样（增加点云密度）")
-    parser.add_argument("--upsample-voxel", type=float, default=1.0,
-                        help="上采样体素 mm（默认 1.0，越小插值点越多）")
+                        help="启用上采样（在近邻间插值中点）")
+    parser.add_argument("--neighbor-k", type=int, default=6,
+                        help="上采样近邻数（默认 6，生成点数约 N*K/2）")
     parser.add_argument("--color-k", type=int, default=8,
                         help="上采样颜色插值近邻数（默认 8）")
+    parser.add_argument("--jitter", type=float, default=0.1,
+                        help="上采样法向量随机偏移比例（默认 0.1）")
 
     # 泊松参数
     parser.add_argument("--poisson-depth", type=int, default=10,
@@ -463,8 +457,8 @@ def main():
     # ---- Step 5: 上采样（可选）----
     if args.upsample:
         print("[Step 5/8] 上采样（增加点云密度）...")
-        pcd = step_upsample(pcd, voxel_size=args.upsample_voxel,
-                            color_k=args.color_k)
+        pcd = step_upsample(pcd, neighbor_k=args.neighbor_k,
+                            color_k=args.color_k, jitter=args.jitter)
         print()
 
     # 保存清洗后的点云（方便调试）
