@@ -286,7 +286,7 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
                   f"angle={angle_out:.2f}°  {log.get('init_source','')}  {status}")
 
     # ---- 跳跃边 ----
-    print(f"\n  构建跳跃边 (i ↔ i+2)...")
+    print(f"\n  构建跳跃边 (i <-> i+2)...")
     for i in range(n - 2):
         src_data = pcds_data[i + 2]
         tgt_data = pcds_data[i]
@@ -368,6 +368,7 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--voxel", type=float, default=8.0)
     parser.add_argument("--loop-closures", type=int, default=3)
+    parser.add_argument("--no-color-icp", action="store_true")
     parser.add_argument("--loop-weight", type=float, default=10.0,
                         help="闭环边权重倍数（默认 10）。越大首尾越严格重合，"
                              "但局部形变也越大。范围 5-50。")
@@ -376,6 +377,8 @@ def main():
                         help="每帧旋转角度（度）。不指定时从 metadata.json 自动算")
     parser.add_argument("--rotation-center", type=float, nargs=3, default=None,
                         help="旋转中心 (x y z) mm。不指定时用原点")
+    parser.add_argument("--frame-range", type=int, nargs=2, default=None,
+                        help="手动指定帧范围 start end (如 --frame-range 5 123)")
     args = parser.parse_args()
 
     print("=" * 64)
@@ -432,6 +435,12 @@ def main():
     if len(pcd_files) < 3:
         print(f"✗ 帧数太少 ({len(pcd_files)})")
         sys.exit(1)
+
+    if args.frame_range:
+        start_f, end_f = args.frame_range
+        pcd_files = [f for f in pcd_files
+                     if start_f <= int(os.path.splitext(os.path.basename(f))[0]) <= end_f]
+        print(f"  手动帧范围: {start_f}-{end_f} = {len(pcd_files)} 帧")
 
     pcds_data = []
     t0 = time.time()
