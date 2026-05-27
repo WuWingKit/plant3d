@@ -13,6 +13,8 @@
 | 3 | `06_stage3_register.py` | 多帧配准 (Pose Graph + Color ICP) |
 | 9 | `09_postprocess.py` | 9步后处理: SOR+ROR+降采样+RANSAC+泊松+填洞(pymeshlab)+平滑+法向修正+去碎片 |
 | 10 | `10_upsample.py` | 点云上采样(线性插值)，从09的中间结果进一步加密 |
+| 11 | `11_slice_solid.py` | 切片堆叠法生成立体模型（沿Y轴切片+轮廓拟合+三角带连接） |
+| 12 | `12_hull_colored.py` | 凸包/凹包包裹点云+颜色上色，支持分区域alpha、细分、朝向修正 |
 
 ## 09_postprocess 最佳参数
 
@@ -39,6 +41,30 @@ python 09_postprocess.py --input capture_xxx --source pcd_upsampled.ply \
 - pymeshlab 填洞后面片朝向会反转，需要 step_fix_normals 修正
 - 花瓶分界面在 Y≈30-44，平滑需渐变过渡避免硬边界
 - 依赖: open3d, pymeshlab, opencv-python, numpy
+
+## 12_hull_colored 最佳参数
+
+```bash
+# 凹包包裹 + 颜色上色（分区域alpha）
+python 12_hull_colored.py --input capture_xxx --source pcd_postprocessed.ply \
+    --alpha 4.5 --outlier-pct 0.03 --subdivide 2 --smooth 30 --color-radius 20
+```
+
+流程:
+1. 去除 3% 离群点（最远离质心）
+2. Delaunay 四面体化
+3. 分区域 alpha shape：上部(alpha=4.5)保叶片细节，下部(alpha=6)保花盆底部连通
+4. 逐面朝向修正（法向朝外）
+5. Loop 细分 2 次增加面数
+6. Taubin 平滑 30 次
+7. 细分后再次朝向修正
+8. KNN 中值上色（抗暗色干扰）
+
+注意:
+- alpha shape 会产生 non-manifold edge（Open3D 警告），不影响使用
+- 朝向修正是关键：50% 面需要翻转，否则光照下出现深色斑块
+- 颜色用 KNN 中值而非均值，避免暗色点拉低颜色
+- 依赖: open3d, scipy, numpy
 
 ## Stage 3 核心修复 (最重要)
 
