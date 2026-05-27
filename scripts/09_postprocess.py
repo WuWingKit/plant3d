@@ -341,30 +341,67 @@ def step_fill_holes(mesh, max_hole_size=500):
 #  Mesh 后处理（步骤 8-9）
 # ============================================================
 
-def step_taubin(mesh, n_iter=20, lamb=0.5, mu=-0.53):
+def step_smooth(mesh, n_iter=50, method="pymeshlab_taubin"):
     """
-    Taubin 平滑。
+    Mesh 平滑。支持两种后端：
 
-    比 Laplacian 更好：交替正向（收缩）和负向（膨胀）平滑，
-    消除 Laplacian 的"缩水"问题，保留整体形状同时去除高频噪声。
+    method:
+      'pymeshlab_taubin'  - pymeshlab Taubin（默认，效果更好）
+      'pymeshlab_laplacian' - pymeshlab Laplacian（更强但会缩水）
+      'open3d_taubin'     - Open3D Taubin（兜底）
 
-    lamb: 正向步长（0.5 推荐）
-    mu:   负向步长（-0.53 推荐，满足 Taubin 条件 |mu| > |lamb|）
-    n_iter: 迭代次数。每次迭代 = 一次正向 + 一次负向。
-      10 次：轻微平滑，保留细节
-      20 次：中度平滑，花瓶表面明显更光滑
-      30 次：填洞后的推荐值，让新旧面自然衔接
-      50 次：重度平滑，植物细节丢失但花瓶非常光滑
+    n_iter: 迭代次数。
     """
     n_vert_before = len(mesh.vertices)
-    mesh = mesh.filter_smooth_taubin(
-        number_of_iterations=n_iter,
-        lambda_filter=lamb,
-        mu=mu)
-    mesh.compute_vertex_normals()
-    print(f"  Taubin 平滑 ({n_iter} 次迭代): "
-          f"{n_vert_before:,} 顶点 → {len(mesh.vertices):,} 顶点（顶点数不变，位置变化）")
-    return mesh
+
+    if method.startswith("pymeshlab"):
+        import pymeshlab
+
+        # Open3D -> pymeshlab
+        ms = pymeshlab.MeshSet()
+        verts = np.asarray(mesh.vertices)
+        faces = np.asarray(mesh.triangles)
+        m = pymeshlab.Mesh(vertex_matrix=verts, face_matrix=faces)
+        ms.add_mesh(m)
+
+        if method == "pymeshlab_taubin":
+            ms.apply_coord_taubin_smoothing(stepsmoothnum=n_iter)
+            print(f"  pymeshlab Taubin ({n_iter} 次): ", end="")
+        elif method == "pymeshlab_laplacian":
+            ms.apply_coord_laplacian_smoothing(stepsmoothnum=n_iter)
+            print(f"  pymeshlab Laplacian ({n_iter} 次): ", end="")
+
+        # pymeshlab -> Open3D
+        result = ms.current_mesh()
+        out = o3d.geometry.TriangleMesh()
+        out.vertices = o3d.utility.Vector3dVector(result.vertex_matrix())
+        out.triangles = o3d.utility.Vector3iVector(result.face_matrix())
+
+        # 保留顶点颜色
+        if len(np.asarray(mesh.vertex_colors)) > 0:
+            old_colors = np.asarray(mesh.vertex_colors)
+            old_verts = np.asarray(mesh.vertices)
+            tree = o3d.geometry.KDTreeFlann(
+                o3d.geometry.PointCloud(o3d.utility.Vector3dVector(old_verts)))
+            new_verts = np.asarray(out.vertices)
+            new_colors = np.zeros((len(new_verts), 3))
+            for i in range(len(new_verts)):
+                _, idx, _ = tree.search_knn_vector_3d(out.vertices[i], 1)
+                new_colors[i] = old_colors[idx[0]]
+            out.vertex_colors = o3d.utility.Vector3dVector(new_colors)
+
+        out.compute_vertex_normals()
+        print(f"{n_vert_before:,} 顶点 -> {len(out.vertices):,} 顶点")
+        return out
+
+    else:
+        # Open3D Taubin 兜底
+        out = mesh.filter_smooth_taubin(number_of_iterations=n_iter,
+                                        lambda_filter=0.5, mu=-0.53)
+        out.compute_vertex_normals()
+        print(f"  Open3D Taubin ({n_iter} 次): "
+              f"{n_vert_before:,} 顶点 -> {len(out.vertices):,} 顶点")
+        return out
 
 
 def step_fix_normals(mesh):
@@ -482,11 +519,13 @@ def main():
                         help="跳过孔洞填补")
 
     # Mesh 平滑参数
-    parser.add_argument("--taubin-iter", type=int, default=30,
-                        help="Taubin 平滑迭代次数（默认 30）"
-                             " 10=轻微 20=中度 30=填洞推荐 50=重度")
+    parser.add_argument("--smooth-method", default="pymeshlab_taubin",
+                        choices=["pymeshlab_taubin", "pymeshlab_laplacian", "open3d_taubin"],
+                        help="平滑方法（默认 pymeshlab_taubin）")
+    parser.add_argument("--taubin-iter", type=int, default=50,
+                        help="平滑迭代次数（默认 50）")
     parser.add_argument("--no-taubin", action="store_true",
-                        help="跳过 Taubin 平滑")
+                        help="跳过平滑")
     parser.add_argument("--min-cluster-ratio", type=float, default=0.01,
                         help="孤立面片删除阈值（默认 0.01 = 1%%）")
 
@@ -574,12 +613,13 @@ def main():
         print("[Step 7/9] 跳过填洞（--no-fill）")
     print()
 
-    # ---- Step 8: Taubin 平滑 ----
+    # ---- Step 8: 平滑 ----
     if not args.no_taubin:
-        print(f"[Step 8/9] Taubin 平滑（{args.taubin_iter} 次迭代）...")
-        mesh = step_taubin(mesh, n_iter=args.taubin_iter)
+        print(f"[Step 8/9] 平滑（{args.smooth_method}, {args.taubin_iter} 次）...")
+        mesh = step_smooth(mesh, n_iter=args.taubin_iter,
+                           method=args.smooth_method)
     else:
-        print("[Step 8/9] 跳过 Taubin 平滑（--no-taubin）")
+        print("[Step 8/9] 跳过平滑（--no-taubin）")
         mesh.compute_vertex_normals()
     print()
 
