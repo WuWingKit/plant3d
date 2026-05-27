@@ -309,11 +309,18 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
             np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
 
     def should_reject(T, expected_angle_deg):
-        """改进 K：检查配准结果的角度是否合理，偏差太大就拒绝"""
+        """改进 K：检查配准结果的角度是否合理，偏差太大就拒绝。
+        对期望角度取模 360 后再比较，正确处理闭环边（如首尾差 352°≈8°）。"""
         if expected_angle_deg is None or angle_reject_deg <= 0:
             return False
         actual = extract_angle(T)
-        diff = abs(actual - abs(expected_angle_deg))
+        # 期望角度归一化到 [0, 180]（因为 arccos 返回 [0, pi]）
+        expected_mod = abs(expected_angle_deg) % 360.0
+        if expected_mod > 180.0:
+            expected_mod = 360.0 - expected_mod
+        # 模 360 比较：取较短的那段弧
+        raw = abs(actual - expected_mod)
+        diff = min(raw, 360.0 - raw)
         return diff > angle_reject_deg
 
     # ---- 相邻边 ----
