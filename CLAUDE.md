@@ -11,8 +11,34 @@
 | 1 | `04_stage1_pcd_v5.py` | 深度图→彩色点云，去除背景/地面 |
 | 2 | `05_stage2_segment_v3.py` | 裁剪出黑色转盘以上的盆栽 |
 | 3 | `06_stage3_register.py` | 多帧配准 (Pose Graph + Color ICP) |
-| 9 | `09_postprocess.py` | 9步后处理: SOR+ROR+降采样+RANSAC+上采样+泊松+填洞(pymeshlab)+Taubin+去碎片 |
+| 9 | `09_postprocess.py` | 9步后处理: SOR+ROR+降采样+RANSAC+泊松+填洞(pymeshlab)+平滑+法向修正+去碎片 |
 | 10 | `10_upsample.py` | 点云上采样(线性插值)，从09的中间结果进一步加密 |
+
+## 09_postprocess 最佳参数
+
+```bash
+# 完整流程: 10_upsample → 09_postprocess
+python 10_upsample.py --input capture_xxx
+python 09_postprocess.py --input capture_xxx --source pcd_upsampled.ply \
+    --poisson-depth 10 --density-cut 0.05 --normal-radius 12 \
+    --fill-hole-size 200 --smooth-method pymeshlab_laplacian --taubin-iter 25
+```
+
+后处理步骤:
+1. SOR 统计滤波 (k=20, std=2.0)
+2. ROR 半径滤波 (min=5, r=10mm)
+3. 体素降采样 (2mm)
+4. RANSAC 去平面 (可选)
+5. 泊松重建 (depth=10, density_cut=0.05, normal_radius=12)
+6. 填洞 pymeshlab (max_hole_size=200) + 法向量修正
+7. 平滑 pymeshlab Laplacian 25次 (全局)
+8. 花瓶区域追加 HC Laplacian 渐变平滑 (Y>60:30次, Y40-60:15次, Y30-40:5次)
+9. 删除孤立碎片
+
+注意:
+- pymeshlab 填洞后面片朝向会反转，需要 step_fix_normals 修正
+- 花瓶分界面在 Y≈30-44，平滑需渐变过渡避免硬边界
+- 依赖: open3d, pymeshlab, opencv-python, numpy
 
 ## Stage 3 核心修复 (最重要)
 
