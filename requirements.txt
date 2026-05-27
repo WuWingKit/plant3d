@@ -1,5 +1,7 @@
 numpy>=1.20
 opencv-python>=4.5
 open3d>=0.15
+scipy>=1.7
+pymeshlab>=2022.2
 pykinect2>=0.1.0
 comtypes

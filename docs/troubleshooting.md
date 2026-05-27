@@ -101,9 +101,9 @@
 
 **原因**：可能是数据格式问题。
 
-**处理**：跑诊断：
+**处理**：用 Python 快速检查：
 ```bash
-python tool_diagnose_depth.py --dir capture_花瓶_xxx/depth
+python -c "import cv2; img=cv2.imread('capture_花瓶_xxx/depth/0000.png',cv2.IMREAD_UNCHANGED); print(f'dtype={img.dtype}, shape={img.shape}')"
 ```
 - 如果 dtype 是 uint16 → 正常（深度图归一化前都看着黑）
 - 如果 dtype 是 uint8 → **数据损坏，重新采集**
@@ -269,7 +269,7 @@ python tool_diagnose_depth.py --dir capture_花瓶_xxx/depth
 
 如果某一步出问题，**别死磕参数**。按这个顺序往回查：
 
-1. **诊断深度数据**（`tool_diagnose_depth.py`）
+1. **诊断深度数据**（用 Python 检查 dtype/shape/有效像素）
 2. **看标定 RMS**（`calibration.json`）
 3. **抽几帧看 aligned 图**（肉眼判断对齐质量）
 4. **抽几帧看 stage1 输出**（点云本身对不对）
@@ -283,7 +283,7 @@ python tool_diagnose_depth.py --dir capture_花瓶_xxx/depth
 把这些发给我（或者贴到 issue）：
 - 控制台完整输出
 - 出问题的 stage 的输出文件截图（MeshLab 截图最好）
-- `tool_diagnose_depth.py` 的输出
+- 深度图 dtype/shape/有效像素比例
 - `calibration.json` 的 RMS 部分
 
 绝大多数问题都能从这些信息定位。

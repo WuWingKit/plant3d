@@ -16,7 +16,7 @@ Stage 3: Pose Graph 配准 →  merged_*.ply
        ↓ ✓ 检查 merged_color_coded.ply
 Stage 4: 摆正            →  merged_aligned.ply
        ↓ ✓ 检查花瓶正立
-Stage 5: 泊松重建        →  plant_model.{obj,stl,ply}
+Stage 9: 后处理+泊松重建  →  plant_model.{obj,stl,ply}
 ```
 
 ---
@@ -24,7 +24,7 @@ Stage 5: 泊松重建        →  plant_model.{obj,stl,ply}
 ## 二、Stage 1: 单帧彩色点云生成
 
 ```bash
-python 04_stage1_pcd.py --input capture_花瓶_xxx --calib calib_imgs/calibration.json
+python 04_stage1_pcd_v5.py --input capture_花瓶_xxx --calib calib_imgs/calibration.json
 ```
 
 **作用**：
@@ -63,7 +63,7 @@ python 04_stage1_pcd.py --input capture_花瓶_xxx --calib calib_imgs/calibratio
 ## 三、Stage 2: 前景分离（纯几何）
 
 ```bash
-python 05_stage2_segment.py --input capture_花瓶_xxx
+python 05_stage2_segment_v3.py --input capture_花瓶_xxx
 ```
 
 **作用**：用纯几何方法分离花瓶+植物
@@ -220,28 +220,34 @@ MeshLab 打开 `merged_aligned.ply`：
 
 ---
 
-## 六、Stage 5: 泊松重建
+## 六、后处理：泊松重建 + 9 步清理
 
 ```bash
-python 08_stage5_mesh.py --input capture_花瓶_xxx
+python 10_upsample.py --input capture_花瓶_xxx
+python 09_postprocess.py --input capture_花瓶_xxx --source pcd_upsampled.ply \
+    --poisson-depth 10 --density-cut 0.05 --normal-radius 12
 ```
 
-**作用**：从摆正的点云生成网格模型
+**作用**：从点云生成网格模型，9 步后处理
 
-**算法**：Open3D 的标准泊松重建
-1. 估计法向量（10mm 半径邻域）
-2. 法向一致化（朝外）
-3. 泊松重建（depth=9）
-4. 裁剪低密度顶点（去毛刺）
-5. 顶点颜色映射（最近邻）
+**流程**：
+1. SOR 统计滤波
+2. ROR 半径滤波
+3. 体素降采样
+4. RANSAC 去平面（可选）
+5. 泊松重建
+6. 填洞（pymeshlab）
+7. 平滑（Laplacian / Taubin）
+8. 花瓶区域渐变平滑
+9. 删除孤立碎片
 
 **参数**：
-- `--depth 9` — 泊松深度（默认 9）
-  - 8 → 粗糙但快
-  - 10 → 精细但慢
-- `--density-cut 0.10` — 低密度裁剪比例
-- `--normal-radius 10` — 法向估计半径 mm
-- `--source merged_clean.ply` — 用没摆正的版本（默认用 aligned）
+- `--poisson-depth 10` — 泊松深度（默认 9）
+- `--density-cut 0.05` — 低密度裁剪比例（默认 0.02）
+- `--normal-radius 12` — 法向估计半径 mm
+- `--fill-hole-size 200` — 填洞最大边界边长
+- `--smooth-method pymeshlab_laplacian` — 平滑方法
+- `--taubin-iter 25` — 平滑迭代次数
 
 **输出**：
 - `output_v2/plant_model.obj` — 带顶点色
@@ -259,7 +265,7 @@ MeshLab 打开 `plant_model.obj`：
 
 | 现象 | 处理 |
 |---|---|
-| 模型有大洞 | 调大 `--depth 10`；或调小 `--density-cut 0.05` |
+| 模型有大洞 | 调大 `--poisson-depth 10`；或调小 `--density-cut 0.05` |
 | 模型有毛刺 | 调大 `--density-cut 0.15` |
 | 顶部植物缺失 | 输入点云本身就缺，没救（采集时改高度） |
 | 颜色错位 | Stage 1 的颜色就错位，回到标定 |
@@ -304,9 +310,9 @@ MeshLab 打开 `plant_model.obj`：
                  │ 检查正立  │── 歪？ → low-percent↑
                  └───┬──────┘
                      ↓ OK
-                ┌────┴─────┐
-                │ Stage 5  │
-                └────┬─────┘
+                ┌────┴──────┐
+                │ 09 后处理 │
+                └────┬──────┘
                      ↓
                 ┌────┴──────┐
                 │ 检查模型  │── 有洞？ → depth↑
@@ -322,7 +328,7 @@ MeshLab 打开 `plant_model.obj`：
 | Stage 2 | 1 分钟 | 3 分钟 | 15 分钟 |
 | Stage 3 | 2-5 分钟 | 10-20 分钟 | （不推荐）|
 | Stage 4 | 10 秒 | 10 秒 | 10 秒 |
-| Stage 5 | 30 秒 | 1 分钟 | 2 分钟 |
+| 09 后处理 | 30 秒 | 1 分钟 | 2 分钟 |
 | **总计** | **5-8 分钟** | **15-25 分钟** | — |
 
 **推荐用 36 帧**，调通流程后再考虑加帧。

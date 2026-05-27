@@ -108,17 +108,25 @@ capture_花瓶_xxx/
 
 ## 五、采集后的健康检查
 
-如果你不确定数据是不是好的，跑诊断脚本：
+如果你不确定数据是不是好的，可以用 Python 快速检查：
 
 ```bash
-python tool_diagnose_depth.py --dir capture_花瓶_xxx/depth
+python -c "
+import cv2, numpy as np, glob, os
+files = sorted(glob.glob('capture_花瓶_xxx/depth/*.png'))
+print(f'帧数: {len(files)}')
+img = cv2.imread(files[0], cv2.IMREAD_UNCHANGED)
+print(f'格式: dtype={img.dtype}, shape={img.shape}')
+d = img.astype(float)
+d[d==0] = np.nan
+print(f'中位深度: {np.nanmedian(d):.0f}mm, 有效像素: {np.count_nonzero(~np.isnan(d))/d.size*100:.1f}%')
+"
 ```
 
 会告诉你：
 - 帧总数
 - 深度图格式是否正确（uint16, 512×424）
-- 中位深度和分布
-- 有效像素比例
+- 中位深度和有效像素比例
 
 **判断标准**：
 

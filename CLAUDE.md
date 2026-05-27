@@ -4,17 +4,16 @@
 
 ## 流水线 (6 Stages)
 
-| Stage | 脚本 | 功能 |
-|-------|------|------|
-| 0 | `01_capture_calib.py` → `02_calibrate.py` | 相机标定 |
-| 0 | `03_capture_scan.py` | 转盘拍摄 |
-| 1 | `04_stage1_pcd_v5.py` | 深度图→彩色点云，去除背景/地面 |
-| 2 | `05_stage2_segment_v3.py` | 裁剪出黑色转盘以上的盆栽 |
-| 3 | `06_stage3_register.py` | 多帧配准 (Pose Graph + Color ICP) |
-| 9 | `09_postprocess.py` | 9步后处理: SOR+ROR+降采样+RANSAC+泊松+填洞(pymeshlab)+平滑+法向修正+去碎片 |
-| 10 | `10_upsample.py` | 点云上采样(线性插值)，从09的中间结果进一步加密 |
-| 11 | `11_slice_solid.py` | 切片堆叠法生成立体模型（沿Y轴切片+轮廓拟合+三角带连接） |
-| 12 | `12_hull_colored.py` | 凸包/凹包包裹点云+颜色上色，支持分区域alpha、细分、朝向修正 |
+| 阶段 | 脚本 | 功能 |
+|------|------|------|
+| 1 | `01_capture_calib.py` → `02_calibrate.py` | 相机标定 |
+| 2 | `03_capture_scan.py` | 转盘拍摄 |
+| 3 | `04_stage1_pcd_v5.py` | 深度图→彩色点云，去除背景/地面 |
+| 4 | `05_stage2_segment_v3.py` | 裁剪出黑色转盘以上的盆栽 |
+| 5 | `06_stage3_register.py` | 多帧配准 (Pose Graph + Color ICP) |
+| 6 | `09_postprocess.py` | 9步后处理: SOR+ROR+降采样+RANSAC+泊松+填洞(pymeshlab)+平滑+法向修正+去碎片 |
+| 7 | `10_upsample.py` | 点云上采样(线性插值)，从09的中间结果进一步加密 |
+| 8 | `12_hull_colored.py` | 凸包/凹包包裹点云+颜色上色，支持分区域alpha、细分、朝向修正 |
 
 ## 09_postprocess 最佳参数
 
