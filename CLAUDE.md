@@ -18,21 +18,32 @@
 
 **问题**: ICP 从单位矩阵出发，收敛到局部最优 → 每帧只转 ~0.5°（理论值 ~2.99°），累积仅 55° 而非 360°。
 
-**解决**: 
-1. 从 `metadata.json` 读取转速和 fps，算出理论每帧角度
-2. 用 `rotation_matrix_y()` 生成角度初始变换 T_init
-3. ICP 从 T_init 出发 → 收敛到正确值
-4. RANSAC 交叉验证：偏差 <10° 用 RANSAC，>10° 坚持角度初值
+**解决** (三组改进):
+1. **角度初值**: 从 metadata.json 算理论角度，ICP 从初值出发 → 收敛到正确值
+2. **RANSAC 交叉验证**: 偏差 <10° 用 RANSAC，>10° 坚持角度初值
+3. **Pose Graph 结构改进 (A+E+K)**:
+   - A: 跳跃边 i↔i+2/3/4（更多冗余约束）
+   - E: 闭环 n//8 对均匀分布（消除累积误差堆积）
+   - K: 角度偏差 >5° 的坏边直接丢弃
+4. **ICP 精度 (C+N)**:
+   - C: 第4层精细 ICP (voxel×0.5, 40次迭代)
+   - N: 更严格收敛标准 (relative_fitness/rmse=1e-7)
+5. **两轮优化 (D+F)**:
+   - D: 第二轮用第一轮位姿作 ICP 初值重新配准
+   - F: max_correspondence_distance 1.0, preference_loop_closure=5.0
 
 ```bash
-# 推荐用法（自动读 metadata）
-python 06_stage3_register.py --input capture_xxx
-
-# 手动指定帧范围（5-123 为一圈，首尾闭合）
+# 推荐用法（所有改进全开，两轮优化）
 python 06_stage3_register.py --input capture_xxx --frame-range 5 123
 
-# 手动指定角度和旋转中心
-python 06_stage3_register.py --input capture_xxx --deg-per-frame 2.988 --rotation-center 0 0 0
+# 关闭两轮优化（省时间）
+python 06_stage3_register.py --input capture_xxx --no-two-pass
+
+# 自定义跳跃步长
+python 06_stage3_register.py --input capture_xxx --skip-steps 2 3
+
+# 调整坏边剔除阈值
+python 06_stage3_register.py --input capture_xxx --angle-reject 8.0
 ```
 
 ## 关键参数
