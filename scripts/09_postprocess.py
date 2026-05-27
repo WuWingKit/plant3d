@@ -367,6 +367,36 @@ def step_taubin(mesh, n_iter=20, lamb=0.5, mu=-0.53):
     return mesh
 
 
+def step_fix_normals(mesh):
+    """
+    修正法向量方向，确保朝外。
+
+    用符号体积检测：如果体积为负，说明大部分面片朝内，需要翻转。
+    翻转后重新计算法向量。
+    """
+    verts = np.asarray(mesh.vertices)
+    tris = np.asarray(mesh.triangles)
+
+    if len(tris) == 0 or len(verts) == 0:
+        return mesh
+
+    # 计算符号体积（正 = 法向朝外，负 = 法向朝内）
+    v0 = verts[tris[:, 0]]
+    v1 = verts[tris[:, 1]]
+    v2 = verts[tris[:, 2]]
+    signed_vol = np.sum(v0 * np.cross(v1, v2)) / 6.0
+
+    if signed_vol < 0:
+        # 法向朝内，翻转所有三角形
+        mesh.triangles = o3d.utility.Vector3iVector(tris[:, [0, 2, 1]])
+        print(f"  法向量修正: 检测到朝内 (vol={signed_vol:.1f}), 已翻转")
+    else:
+        print(f"  法向量检查: 朝向正确 (vol={signed_vol:.1f})")
+
+    mesh.compute_vertex_normals()
+    return mesh
+
+
 def step_remove_small_clusters(mesh, min_triangle_ratio=0.01):
     """
     删除孤立小面片簇（碎片）。
@@ -556,6 +586,11 @@ def main():
     # ---- Step 9: 删除孤立小面片 ----
     print("[Step 9/9] 删除孤立小面片...")
     mesh = step_remove_small_clusters(mesh, min_triangle_ratio=args.min_cluster_ratio)
+    print()
+
+    # ---- 法向量修正 ----
+    print("[修正] 法向量方向检查...")
+    mesh = step_fix_normals(mesh)
     print()
 
     # ---- 输出 ----
