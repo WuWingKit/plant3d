@@ -97,7 +97,7 @@ def step_voxel(pcd, voxel_size=2.0):
     return pcd_down
 
 
-def step_upsample(pcd, voxel_size=2.0, target_points=None):
+def step_upsample(pcd, voxel_size=1.0, points_per_voxel=3):
     """
     上采样：在每个体素内插值新点，增加点云密度。
 
@@ -107,7 +107,7 @@ def step_upsample(pcd, voxel_size=2.0, target_points=None):
     3. 新点继承原有点的颜色（插值）
 
     voxel_size: 体素尺寸 mm（越小插值点越多）
-    target_points: 目标点数（如果指定，自动调整插倍数）
+    points_per_voxel: 每个体素插值的点数（默认 3）
     """
     n_before = len(pcd.points)
 
@@ -115,18 +115,16 @@ def step_upsample(pcd, voxel_size=2.0, target_points=None):
     pcd.estimate_normals(
         o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
 
-    # 体素化
-    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size)
-
-    # 获取每个体素内的点
+    # 获取数据
     pts = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors) if len(np.asarray(pcd.colors)) > 0 else None
     normals = np.asarray(pcd.normals) if len(np.asarray(pcd.normals)) > 0 else None
 
     # 计算每个点所属的体素索引
+    origin = pts.min(axis=0)
     voxel_indices = {}
     for i, pt in enumerate(pts):
-        voxel_idx = tuple(((pt - voxel_grid.origin) / voxel_size).astype(int))
+        voxel_idx = tuple(((pt - origin) / voxel_size).astype(int))
         if voxel_idx not in voxel_indices:
             voxel_indices[voxel_idx] = []
         voxel_indices[voxel_idx].append(i)
@@ -134,9 +132,13 @@ def step_upsample(pcd, voxel_size=2.0, target_points=None):
     # 在每个体素内插值新点
     new_points = []
     new_colors = []
+    n_voxels_with_points = 0
+
     for voxel_idx, point_indices in voxel_indices.items():
         if len(point_indices) < 2:
             continue
+
+        n_voxels_with_points += 1
 
         # 获取体素内的点
         voxel_pts = pts[point_indices]
@@ -152,7 +154,7 @@ def step_upsample(pcd, voxel_size=2.0, target_points=None):
             avg_normal = avg_normal / np.linalg.norm(avg_normal)
 
             # 在法向量方向上插值
-            for _ in range(2):  # 每个体素插值 2 个点
+            for _ in range(points_per_voxel):
                 offset = np.random.uniform(-std, std)
                 new_pt = centroid + offset * avg_normal
                 new_points.append(new_pt)
@@ -182,8 +184,9 @@ def step_upsample(pcd, voxel_size=2.0, target_points=None):
         pcd_upsampled = pcd
 
     n_after = len(pcd_upsampled.points)
-    print(f"  上采样 (voxel={voxel_size}mm): "
+    print(f"  上采样 (voxel={voxel_size}mm, {points_per_voxel}点/体素): "
           f"{n_before:,} → {n_after:,} 点 (+{n_after-n_before:,})")
+    print(f"  有效体素: {n_voxels_with_points:,}")
     return pcd_upsampled
 
 
@@ -209,10 +212,10 @@ def step_recolor_from_images(pcd, input_dir, poses, calib, max_dist=3000):
     pts = np.asarray(pcd.points)
     n_points = len(pts)
 
-    # 相机内参
-    color_K = np.array(calib['color']['K'])
-    fx, fy = color_K[0, 0], color_K[1, 1]
-    cx, cy = color_K[0, 2], color_K[1, 2]
+    # 相机内参（aligned 照片是深度图对齐到颜色图的，用深度相机内参）
+    depth_K = np.array(calib['depth']['K'])
+    fx, fy = depth_K[0, 0], depth_K[1, 1]
+    cx, cy = depth_K[0, 2], depth_K[1, 2]
 
     # 累积颜色和权重
     color_sum = np.zeros((n_points, 3))
@@ -222,7 +225,7 @@ def step_recolor_from_images(pcd, input_dir, poses, calib, max_dist=3000):
 
     for pose_data in poses:
         frame_id = pose_data['id']
-        T = np.array(pose_data['pose'])  # 4x4 位姿矩阵
+        T = np.array(pose_data['pose'])  # 4x4 位姿矩阵（从参考帧到每帧）
 
         # 读取对齐照片
         img_path = os.path.join(aligned_dir, f"{frame_id:04d}.png")
@@ -233,10 +236,10 @@ def step_recolor_from_images(pcd, input_dir, poses, calib, max_dist=3000):
         if img is None:
             continue
 
-        # 将点云变换到该帧的相机坐标系
-        # 注意：poses 是从世界到相机的变换，需要取逆
-        T_inv = np.linalg.inv(T)
-        pts_cam = (T_inv[:3, :3] @ pts.T + T_inv[:3, 3:]).T
+        # poses 是从参考帧到每帧的变换
+        # 点云在参考帧坐标系，需要变换到每帧的相机坐标系
+        # 注意：aligned 照片已经是深度图对齐到颜色图的，所以用深度相机内参
+        pts_cam = (T[:3, :3] @ pts.T + T[:3, 3:]).T
 
         # 投影到图像平面
         u = (pts_cam[:, 0] * fx / pts_cam[:, 2] + cx).astype(int)
