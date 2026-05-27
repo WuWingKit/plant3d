@@ -11,7 +11,7 @@
 | 1 | `04_stage1_pcd_v5.py` | 深度图→彩色点云，去除背景/地面 |
 | 2 | `05_stage2_segment_v3.py` | 裁剪出黑色转盘以上的盆栽 |
 | 3 | `06_stage3_register.py` | 多帧配准 (Pose Graph + Color ICP) |
-| 9 | `09_postprocess.py` | 7步后处理: SOR+ROR+降采样+泊松+Taubin+上采样+颜色重采样 |
+| 9 | `09_postprocess.py` | 8步后处理: SOR+ROR+降采样+RANSAC+上采样+泊松+Taubin+去碎片 |
 
 ## Stage 3 核心修复 (最重要)
 
