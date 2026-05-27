@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 素材 — 图片、深度图、点云
+capture_xxx/aligned/
+capture_xxx/color/
+capture_xxx/depth/
+capture_xxx/pcds/
+capture_xxx/pcds_seg/
+calib_imgs/color/
+calib_imgs/ir/
+
+# 成果 — 输出模型、合并结果
+capture_xxx/output_v2/
+*.stl
+*.obj
+*.ply
+merged_*.ply
+plant_model.*
+
+# 压缩包
+*.zip
+
+# 系统文件
+.DS_Store
+Thumbs.db
