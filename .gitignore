@@ -8,16 +8,16 @@ __pycache__/
 .idea/
 
 # 素材 — 图片、深度图、点云
-capture_xxx/aligned/
-capture_xxx/color/
-capture_xxx/depth/
-capture_xxx/pcds/
-capture_xxx/pcds_seg/
-calib_imgs/color/
-calib_imgs/ir/
+scripts/capture_xxx/aligned/
+scripts/capture_xxx/color/
+scripts/capture_xxx/depth/
+scripts/capture_xxx/pcds/
+scripts/capture_xxx/pcds_seg/
+scripts/calib_imgs/color/
+scripts/calib_imgs/ir/
 
 # 成果 — 输出模型、合并结果
-capture_xxx/output_v2/
+scripts/capture_xxx/output_v2/
 *.stl
 *.obj
 *.ply
