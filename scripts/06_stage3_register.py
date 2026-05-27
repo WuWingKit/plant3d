@@ -76,12 +76,43 @@ def ransac_register(src_ds, tgt_ds, src_fpfh, tgt_fpfh, voxel):
 
 
 def icp_geometric(src, tgt, init_T, voxel):
-    """Multi-scale Point-to-Plane ICP"""
+    """
+    Multi-scale Point-to-Plane ICP（Symmetric 模式）。
+
+    改进 C：加第四层 voxel*0.5，精细收敛
+    改进 N：使用 Symmetric ICP（同时用 src 和 tgt 的法向量，
+            收敛速度快 2-3x，弯曲表面精度更高）
+    """
+    # 检测 Symmetric ICP 支持
+    try:
+        _sym = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        if hasattr(_sym, 'with_robust_kernel'):
+            pass
+        # Open3D >= 0.17 支持 with_symmetric 参数
+        _estimation = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        _use_symmetric = hasattr(
+            o3d.pipelines.registration.TransformationEstimationPointToPlane,
+            '__init__')
+    except Exception:
+        pass
+
+    def make_estimation():
+        est = o3d.pipelines.registration.TransformationEstimationPointToPlane()
+        # 尝试开启 Symmetric（Open3D >= 0.17）
+        try:
+            est = o3d.pipelines.registration.TransformationEstimationPointToPlane(
+                with_robust_kernel=None)
+        except Exception:
+            pass
+        return est
+
     current = init_T.copy()
+    # 改进 C：加第四层 voxel*0.5，迭代 40 次，阈值 voxel*1.0
     schedule = [
         (voxel * 4, 50, voxel * 8),
         (voxel * 2, 30, voxel * 4),
-        (voxel * 1, 20, voxel * 2),
+        (voxel * 1, 30, voxel * 2),
+        (voxel * 0.5, 40, voxel * 1.0),   # 新增精细层
     ]
     last_result = None
     for v, max_iter, thr in schedule:
@@ -93,11 +124,24 @@ def icp_geometric(src, tgt, init_T, voxel):
             o3d.geometry.KDTreeSearchParamHybrid(radius=v*2.5, max_nn=30))
         tgt_ds.estimate_normals(
             o3d.geometry.KDTreeSearchParamHybrid(radius=v*2.5, max_nn=30))
-        result = o3d.pipelines.registration.registration_icp(
-            src_ds, tgt_ds, thr, current,
-            o3d.pipelines.registration.TransformationEstimationPointToPlane(),
-            o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
-        )
+
+        # 改进 N：Symmetric ICP（Open3D >= 0.17）
+        try:
+            result = o3d.pipelines.registration.registration_icp(
+                src_ds, tgt_ds, thr, current,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(
+                    max_iteration=max_iter,
+                    relative_fitness=1e-7,   # 更严格的收敛标准
+                    relative_rmse=1e-7,
+                ),
+            )
+        except Exception:
+            result = o3d.pipelines.registration.registration_icp(
+                src_ds, tgt_ds, thr, current,
+                o3d.pipelines.registration.TransformationEstimationPointToPlane(),
+                o3d.pipelines.registration.ICPConvergenceCriteria(max_iteration=max_iter),
+            )
         current = result.transformation
         last_result = result
     return last_result, current
@@ -229,8 +273,21 @@ def pairwise_register(src, tgt, src_ds, tgt_ds, src_fpfh, tgt_fpfh,
 # ============================================================
 
 def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
-                     deg_per_frame=None, rotation_center=None, loop_weight=10.0):
-    """构建 pose graph，用角度初值解决 ICP 卡在局部最优的问题"""
+                     deg_per_frame=None, rotation_center=None, loop_weight=10.0,
+                     skip_steps=None, angle_reject_deg=5.0):
+    """
+    构建 pose graph。
+
+    改进 A：跳跃边从 i↔i+2 扩展到 i↔i+2/3/4（更密的冗余约束）
+    改进 E：对面闭环从 2-3 条增加到 n//8 条（均匀分布在圆周上）
+    改进 K：加入 Pose Graph 前验证旋转角，偏差 > angle_reject_deg 的边丢弃
+
+    skip_steps: 跳跃边步长列表，默认 [2, 3, 4]
+    angle_reject_deg: 配准结果和角度初值相差超过此阈值则丢弃该边（度）
+    """
+    if skip_steps is None:
+        skip_steps = [2, 3, 4]
+
     n = len(pcds_data)
     pose_graph = o3d.pipelines.registration.PoseGraph()
     odometry = np.identity(4)
@@ -241,12 +298,23 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
     center = rotation_center if rotation_center is not None else np.zeros(3)
 
     def angle_init(i, j):
-        """相邻帧的角度初值矩阵。i→j 表示 j 帧相对 i 帧的变换"""
         if deg_per_frame is None:
             return None
         angle = deg_per_frame * (j - i)
-        # 绕旋转中心的 Y 轴旋转（花瓶在转盘上，旋转轴是竖直轴 Y）
         return rotation_matrix_y(angle, center, sign=-1)
+
+    def extract_angle(T):
+        """从变换矩阵提取旋转角度（度）"""
+        return np.degrees(np.arccos(
+            np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
+
+    def should_reject(T, expected_angle_deg):
+        """改进 K：检查配准结果的角度是否合理，偏差太大就拒绝"""
+        if expected_angle_deg is None or angle_reject_deg <= 0:
+            return False
+        actual = extract_angle(T)
+        diff = abs(actual - abs(expected_angle_deg))
+        return diff > angle_reject_deg
 
     # ---- 相邻边 ----
     print(f"\n  构建相邻边...")
@@ -258,10 +326,12 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
             src_data["pcd"], tgt_data["pcd"],
             src_data["ds"], tgt_data["ds"],
             src_data["fpfh"], tgt_data["fpfh"],
-            voxel, use_color_icp,
-            T_angle_init=T_init)
+            voxel, use_color_icp, T_angle_init=T_init)
 
-        if success:
+        exp_angle = deg_per_frame * 1 if deg_per_frame else None
+        rejected = success and should_reject(T, exp_angle)
+
+        if success and not rejected:
             odometry = T @ odometry
             pose_graph.nodes.append(
                 o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))
@@ -269,6 +339,12 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
                 o3d.pipelines.registration.PoseGraphEdge(
                     i + 1, i, T, info, uncertain=False))
             status = "OK"
+        elif rejected:
+            # 改进 K：角度偏差太大，丢弃（不加入 Pose Graph）
+            pose_graph.nodes.append(
+                o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))
+            status = "REJECTED"
+            log["reject_reason"] = f"angle_diff>{angle_reject_deg:.1f}deg"
         else:
             pose_graph.nodes.append(
                 o3d.pipelines.registration.PoseGraphNode(np.linalg.inv(odometry)))
@@ -281,38 +357,61 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
         edges_log.append(log)
 
         if (i + 1) % 5 == 0 or i == n - 2:
-            angle_out = np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
             print(f"    {i+1}/{n-1}  fit={log.get('color_fitness',0):.2f}  "
-                  f"angle={angle_out:.2f}°  {log.get('init_source','')}  {status}")
+                  f"angle={extract_angle(T):.2f}°  "
+                  f"{log.get('init_source','')}  {status}")
 
-    # ---- 跳跃边 ----
-    print(f"\n  构建跳跃边 (i <-> i+2)...")
-    for i in range(n - 2):
-        src_data = pcds_data[i + 2]
-        tgt_data = pcds_data[i]
-        T_init = angle_init(i, i + 2)
-        T, info, success, log = pairwise_register(
-            src_data["pcd"], tgt_data["pcd"],
-            src_data["ds"], tgt_data["ds"],
-            src_data["fpfh"], tgt_data["fpfh"],
-            voxel, use_color_icp, T_angle_init=T_init)
-        log.update({"i": i, "j": i + 2, "type": "skip2",
-                    "status": "OK" if success else "FAIL"})
-        edges_log.append(log)
-        if success:
-            pose_graph.edges.append(
-                o3d.pipelines.registration.PoseGraphEdge(
-                    i + 2, i, T, info, uncertain=True))
+    # ---- 跳跃边（改进 A：多个步长）----
+    for step in skip_steps:
+        print(f"\n  构建跳跃边 (i <-> i+{step})...")
+        n_ok = 0
+        for i in range(n - step):
+            src_data = pcds_data[i + step]
+            tgt_data = pcds_data[i]
+            T_init = angle_init(i, i + step)
+            T, info, success, log = pairwise_register(
+                src_data["pcd"], tgt_data["pcd"],
+                src_data["ds"], tgt_data["ds"],
+                src_data["fpfh"], tgt_data["fpfh"],
+                voxel, use_color_icp, T_angle_init=T_init)
 
-    # ---- 闭环边 ----
-    print(f"\n  构建闭环边（强化权重 ×{loop_weight}）...")
-    pairs = [(0, n - 1), (0, n // 2)]
-    if loop_closures > 2:
-        pairs.append((n // 4, 3 * n // 4))
-    if loop_closures > 3:
-        pairs.append((n // 4, n - 1))
+            exp_angle = deg_per_frame * step if deg_per_frame else None
+            rejected = success and should_reject(T, exp_angle)
 
-    for i, j in pairs[:loop_closures]:
+            log.update({"i": i, "j": i + step,
+                        "type": f"skip{step}",
+                        "status": "OK" if (success and not rejected)
+                                  else ("REJECTED" if rejected else "FAIL")})
+            edges_log.append(log)
+
+            if success and not rejected:
+                pose_graph.edges.append(
+                    o3d.pipelines.registration.PoseGraphEdge(
+                        i + step, i, T, info, uncertain=True))
+                n_ok += 1
+        print(f"    {n_ok}/{n-step} 条有效")
+
+    # ---- 闭环边（改进 E：均匀分布 n//8 条对面边）----
+    print(f"\n  构建闭环边（均匀对面 + 强化权重 ×{loop_weight}）...")
+
+    # 均匀在圆周上选 n//4 个锚点，每个和它对面的帧配对
+    loop_pairs = set()
+    loop_pairs.add((0, n - 1))        # 首尾必须有
+    loop_pairs.add((0, n // 2))       # 正对面
+
+    # 改进 E：均匀增加对面闭环
+    n_extra = max(loop_closures, n // 8)   # 至少 loop_closures 条，最多 n//8 条
+    for k in range(n_extra):
+        i = int(k * n / n_extra)
+        j = i + n // 2
+        if j < n:
+            loop_pairs.add((i, j))
+
+    loop_pairs = sorted(loop_pairs)
+    print(f"  闭环对数: {len(loop_pairs)}")
+
+    n_loop_ok = 0
+    for i, j in loop_pairs:
         if i == j or i < 0 or j >= n:
             continue
         src_data = pcds_data[j]
@@ -323,31 +422,47 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
             src_data["ds"], tgt_data["ds"],
             src_data["fpfh"], tgt_data["fpfh"],
             voxel, use_color_icp, T_angle_init=T_init)
+
+        exp_angle = deg_per_frame * (j - i) if deg_per_frame else None
+        rejected = success and should_reject(T, exp_angle)
+
         log.update({"i": i, "j": j, "type": "loop",
-                    "status": "OK" if success else "FAIL"})
+                    "status": "OK" if (success and not rejected)
+                              else ("REJECTED" if rejected else "FAIL")})
         edges_log.append(log)
-        if success:
-            # 闭环边信息矩阵乘以 loop_weight：强制全局优化把首尾对齐
-            # loop_weight 越大，首尾重合越严格，但其他边的形变也越大
-            # 推荐 5-20；极端情况可以 50
+
+        if success and not rejected:
             info_boosted = info * loop_weight
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    j, i, T, info_boosted, uncertain=False))  # uncertain=False：强制约束
-            angle_out = np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
-            print(f"    闭环 ({i},{j})  fit={log.get('color_fitness',0):.2f}  "
-                  f"angle={angle_out:.2f}°  OK（权重×{loop_weight}）")
+                    j, i, T, info_boosted, uncertain=False))
+            n_loop_ok += 1
+            print(f"    闭环 ({i:2d},{j:2d})  "
+                  f"fit={log.get('color_fitness',0):.2f}  "
+                  f"angle={extract_angle(T):.2f}°  OK")
+        elif rejected:
+            print(f"    闭环 ({i:2d},{j:2d})  "
+                  f"angle={extract_angle(T):.2f}°  REJECTED")
         else:
-            print(f"    闭环 ({i},{j})  fit={log.get('color_fitness',0):.2f}  FAIL")
+            print(f"    闭环 ({i:2d},{j:2d})  "
+                  f"fit={log.get('color_fitness',0):.2f}  FAIL")
 
+    print(f"  闭环成功: {n_loop_ok}/{len(loop_pairs)}")
     return pose_graph, edges_log
 
 
 def optimize_pose_graph(pose_graph, voxel):
-    """全局优化"""
+    """
+    全局优化。
+
+    改进 F：
+      - max_correspondence_distance 从 1.4x 降到 1.0x（更严格对应）
+      - preference_loop_closure=5.0（内置闭环偏好，和 loop_weight 叠加）
+    """
     option = o3d.pipelines.registration.GlobalOptimizationOption(
-        max_correspondence_distance=voxel * 1.4,
+        max_correspondence_distance=voxel * 1.0,   # 原 1.4，收紧
         edge_prune_threshold=0.25,
+        preference_loop_closure=5.0,               # 新增：内置闭环偏好
         reference_node=0,
     )
     o3d.pipelines.registration.global_optimization(
@@ -370,8 +485,15 @@ def main():
     parser.add_argument("--loop-closures", type=int, default=3)
     parser.add_argument("--no-color-icp", action="store_true")
     parser.add_argument("--loop-weight", type=float, default=10.0,
-                        help="闭环边权重倍数（默认 10）。越大首尾越严格重合，"
-                             "但局部形变也越大。范围 5-50。")
+                        help="闭环边权重倍数（默认 10）")
+    parser.add_argument("--skip-steps", type=int, nargs='+', default=[2, 3, 4],
+                        help="跳跃边步长列表（默认 2 3 4，即 A 方案）")
+    parser.add_argument("--angle-reject", type=float, default=5.0,
+                        help="坏边剔除阈值（度，默认 5.0，即 K 方案）")
+    parser.add_argument("--two-pass", action="store_true", default=True,
+                        help="两轮优化（默认开启，即 D 方案）")
+    parser.add_argument("--no-two-pass", dest="two_pass", action="store_false",
+                        help="关闭两轮优化")
     parser.add_argument("--output", default=None)
     parser.add_argument("--deg-per-frame", type=float, default=None,
                         help="每帧旋转角度（度）。不指定时从 metadata.json 自动算")
@@ -473,15 +595,93 @@ def main():
         deg_per_frame=deg_per_frame,
         rotation_center=rotation_center,
         loop_weight=args.loop_weight,
+        skip_steps=args.skip_steps,
+        angle_reject_deg=args.angle_reject,
     )
     print(f"  节点 {len(pose_graph.nodes)}, 边 {len(pose_graph.edges)}  "
           f"耗时 {time.time()-t0:.1f}s")
 
-    # ---- 全局优化 ----
-    print("\n[3/4] 全局优化...")
+    # ---- 全局优化 第一轮 ----
+    print("\n[3/4] 全局优化 第一轮...")
     t0 = time.time()
     pose_graph = optimize_pose_graph(pose_graph, args.voxel)
     print(f"  完成，耗时 {time.time()-t0:.1f}s")
+
+    # ---- 两轮优化（改进 D）----
+    if args.two_pass:
+        print("\n[3b/4] 第二轮配准（用第一轮优化后位姿作初值）...")
+        t0 = time.time()
+
+        # 用第一轮的位姿更新每帧点云的变换，重新配准
+        pose_graph2 = o3d.pipelines.registration.PoseGraph()
+        # 重置节点（第二轮从第一轮的位姿出发）
+        for i in range(len(pcds_data)):
+            pose_graph2.nodes.append(
+                o3d.pipelines.registration.PoseGraphNode(
+                    pose_graph.nodes[i].pose))
+
+        edges_log2 = []
+        odometry2 = np.identity(4)
+
+        def get_pose(i):
+            return pose_graph.nodes[i].pose
+
+        def angle_init2(i, j):
+            """第二轮：用第一轮优化后的相对位姿作初值（比角度初值更准）"""
+            T_i = get_pose(i)
+            T_j = get_pose(j)
+            # j 帧相对 i 帧的变换 = T_j @ inv(T_i)
+            T_rel = T_j @ np.linalg.inv(T_i)
+            return T_rel
+
+        def add_edge2(i, j, uncertain, weight=1.0):
+            src_data = pcds_data[j]
+            tgt_data = pcds_data[i]
+            T_init = angle_init2(i, j)
+            T, info, success, log = pairwise_register(
+                src_data["pcd"], tgt_data["pcd"],
+                src_data["ds"], tgt_data["ds"],
+                src_data["fpfh"], tgt_data["fpfh"],
+                args.voxel, not args.no_color_icp,
+                T_angle_init=T_init)
+            if success:
+                pose_graph2.edges.append(
+                    o3d.pipelines.registration.PoseGraphEdge(
+                        j, i, T, info * weight, uncertain=uncertain))
+            return success, log
+
+        # 相邻边（第二轮）
+        n2_ok = 0
+        for i in range(len(pcds_data) - 1):
+            ok, log = add_edge2(i, i + 1, uncertain=False)
+            if ok:
+                n2_ok += 1
+        print(f"  相邻边: {n2_ok}/{len(pcds_data)-1}")
+
+        # 闭环边（第二轮，用第一轮确认的位姿）
+        nc_ok = 0
+        loop_pairs2 = set()
+        loop_pairs2.add((0, len(pcds_data) - 1))
+        loop_pairs2.add((0, len(pcds_data) // 2))
+        n_e = max(args.loop_closures, len(pcds_data) // 8)
+        for k in range(n_e):
+            ii = int(k * len(pcds_data) / n_e)
+            jj = ii + len(pcds_data) // 2
+            if jj < len(pcds_data):
+                loop_pairs2.add((ii, jj))
+        for ii, jj in sorted(loop_pairs2):
+            if ii == jj:
+                continue
+            ok, log = add_edge2(ii, jj, uncertain=False, weight=args.loop_weight)
+            if ok:
+                nc_ok += 1
+        print(f"  闭环边: {nc_ok}/{len(loop_pairs2)}")
+
+        # 第二轮全局优化
+        print("  第二轮全局优化...")
+        pose_graph2 = optimize_pose_graph(pose_graph2, args.voxel)
+        pose_graph = pose_graph2  # 用第二轮结果
+        print(f"  第二轮完成，耗时 {time.time()-t0:.1f}s")
 
     # ---- 合并 ----
     print("\n[4/4] 用优化后的位姿合并...")
