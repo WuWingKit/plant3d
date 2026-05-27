@@ -1,0 +1,12 @@
+{
+  "capture_time": "2026-05-17T21:18:14.906277",
+  "n_frames": 241,
+  "fps_target": 8.0,
+  "fps_actual": 6.077601786742681,
+  "n_turns": 2.0,
+  "total_time_sec": 39.653799057006836,
+  "rotation_speed_deg_per_sec": 18.1571505662022,
+  "calibration_file": "calib_imgs/calibration.json",
+  "has_aligned": true,
+  "kinect_version": "v2"
+}
