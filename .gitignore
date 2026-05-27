@@ -24,6 +24,9 @@ scripts/capture_xxx/output_v2/
 merged_*.ply
 plant_model.*
 
+# 文档生成物
+RETROSPECTIVE.docx
+
 # 压缩包
 *.zip
 
