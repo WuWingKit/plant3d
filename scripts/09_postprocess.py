@@ -7,26 +7,24 @@
   3. 体素降采样       合并配准误差导致的双层点
   4. RANSAC 去残留平面（可选，如果 Stage 2 没去干净）
   5. 上采样（可选）   插值新点，颜色从附近 K 点均值获取
-  6. 泊松重建 depth=10
-  7. Taubin 平滑      mesh 表面光滑，不缩水不失细节
-  8. 删除孤立小面片
+  6. 泊松重建 depth=9
+  7. 填补孔洞         fill_holes 修补 mesh 缺失区域
+  8. Taubin 平滑      mesh 表面光滑，不缩水不失细节
+  9. 删除孤立小面片
 
 使用：
-  python 09_postprocess.py --input capture_xxx
+  python 09_postprocess.py --input capture_xxx --source pcd_upsampled.ply
 
-  # 从 merged_clean.ply（Stage 3 output）开始
   # 输出到 capture_xxx/output_v2/plant_model_clean.obj
 
 调参建议：
-  --sor-k 20 --sor-std 2.0     SOR 参数（std 越小删越多）
-  --ror-radius 10 --ror-min 5  ROR 参数（radius mm，min 近邻数）
-  --voxel 2.0                  降采样体素 mm
-  --poisson-depth 10           泊松深度（9/10/11）
-  --taubin-iter 20             Taubin 迭代次数（越多越光滑）
-  --remove-plane               启用 RANSAC 去残留平面（默认关）
-  --upsample                   启用上采样（增加点云密度）
-  --upsample-voxel 1.0         上采样体素 mm
-  --color-k 8                  上采样颜色插值近邻数
+  --poisson-depth 9            泊松深度（8/9/10，越小越不容易出孔洞）
+  --density-cut 0.02           低密度顶点裁剪比例（越小保留越多）
+  --normal-radius 12           法向量估计半径 mm（越大越稳定）
+  --fill-hole-size 500         填洞的最大边界边长
+  --taubin-iter 30             Taubin 迭代次数（越多越光滑）
+  --no-fill                    跳过填洞
+  --no-taubin                  跳过 Taubin 平滑
 
 注意：
   - 每步都会打印点数/面数变化，方便调参
@@ -41,12 +39,12 @@ import numpy as np
 try:
     import open3d as o3d
 except ImportError:
-    print("✗ 需要 open3d: pip install open3d")
+    print("需要 open3d: pip install open3d")
     sys.exit(1)
 
 
 # ============================================================
-#  点云后处理（步骤 1-4）
+#  点云后处理（步骤 1-5）
 # ============================================================
 
 def step_sor(pcd, nb_neighbors=20, std_ratio=2.0):
@@ -242,16 +240,16 @@ def step_remove_plane(pcd, dist_threshold=8.0, min_plane_ratio=0.05):
 
 
 # ============================================================
-#  泊松重建（步骤 5）
+#  泊松重建 + Mesh 修补（步骤 6-7）
 # ============================================================
 
-def step_poisson(pcd, depth=10, density_cut=0.10, normal_radius=8.0, normal_k=30):
+def step_poisson(pcd, depth=9, density_cut=0.02, normal_radius=12.0, normal_k=30):
     """
     泊松表面重建。
 
-    depth=10 比 Stage 5 默认的 9 更精细。
-    normal_radius 从 10 降到 8，棱角更锐利。
-    法向量一致化 k=30（比默认 20 更稳定）。
+    depth=9: 网格粒度适中，稀疏区域不容易出孔洞。
+    density_cut=0.02: 只裁最底部 2% 的低密度顶点（花盆区域点少，不能裁太多）。
+    normal_radius=12: 法向量估计半径更大，结果更稳定。
     """
     print(f"  估计法向量 (radius={normal_radius}mm, k={normal_k})...")
     pcd.estimate_normals(
@@ -263,7 +261,7 @@ def step_poisson(pcd, depth=10, density_cut=0.10, normal_radius=8.0, normal_k=30
         pcd, depth=depth)
     densities = np.asarray(densities)
 
-    # 裁掉低密度顶点（边角碎片）
+    # 裁掉最低密度顶点（边角碎片），保留大部分
     threshold = np.quantile(densities, density_cut)
     vertices_to_remove = densities < threshold
     mesh.remove_vertices_by_mask(vertices_to_remove)
@@ -284,8 +282,63 @@ def step_poisson(pcd, depth=10, density_cut=0.10, normal_radius=8.0, normal_k=30
     return mesh
 
 
+def step_fill_holes(mesh, max_hole_size=500):
+    """
+    填补 mesh 上的孔洞（使用 pymeshlab）。
+
+    max_hole_size: 孔洞边界的最大边数。
+                   500 能覆盖大部分中等孔洞。
+                   太大的孔洞（如花盆底部大面积缺失）填出来会是平的补丁。
+    """
+    import pymeshlab
+
+    n_tri_before = len(mesh.triangles)
+
+    # Open3D mesh -> pymeshlab mesh
+    ms = pymeshlab.MeshSet()
+    verts = np.asarray(mesh.vertices)
+    faces = np.asarray(mesh.triangles)
+    m = pymeshlab.Mesh(vertex_matrix=verts, face_matrix=faces)
+    ms.add_mesh(m)
+
+    # 先修复非流形（close_holes 要求边是流形的）
+    ms.meshing_repair_non_manifold_edges()
+    ms.meshing_repair_non_manifold_vertices()
+
+    # 填洞
+    ms.meshing_close_holes(maxholesize=max_hole_size)
+
+    # pymeshlab mesh -> Open3D mesh
+    result_mesh = ms.current_mesh()
+    out = o3d.geometry.TriangleMesh()
+    out.vertices = o3d.utility.Vector3dVector(result_mesh.vertex_matrix())
+    out.triangles = o3d.utility.Vector3iVector(result_mesh.face_matrix())
+
+    # 保留顶点颜色（如果原 mesh 有的话）
+    if len(np.asarray(mesh.vertex_colors)) > 0:
+        # 用最近邻映射颜色：新顶点取原 mesh 最近顶点的颜色
+        old_colors = np.asarray(mesh.vertex_colors)
+        old_verts = np.asarray(mesh.vertices)
+        tree = o3d.geometry.KDTreeFlann(
+            o3d.geometry.PointCloud(o3d.utility.Vector3dVector(old_verts)))
+        new_verts = np.asarray(out.vertices)
+        new_colors = np.zeros((len(new_verts), 3))
+        for i in range(len(new_verts)):
+            _, idx, _ = tree.search_knn_vector_3d(out.vertices[i], 1)
+            new_colors[i] = old_colors[idx[0]]
+        out.vertex_colors = o3d.utility.Vector3dVector(new_colors)
+
+    out.compute_vertex_normals()
+
+    n_tri_after = len(out.triangles)
+    filled = n_tri_after - n_tri_before
+    print(f"  填补孔洞 (max_hole_size={max_hole_size}): "
+          f"{n_tri_before:,} → {n_tri_after:,} 面片 (+{filled:,} 补丁)")
+    return out
+
+
 # ============================================================
-#  Mesh 后处理（步骤 6-7）
+#  Mesh 后处理（步骤 8-9）
 # ============================================================
 
 def step_taubin(mesh, n_iter=20, lamb=0.5, mu=-0.53):
@@ -300,6 +353,7 @@ def step_taubin(mesh, n_iter=20, lamb=0.5, mu=-0.53):
     n_iter: 迭代次数。每次迭代 = 一次正向 + 一次负向。
       10 次：轻微平滑，保留细节
       20 次：中度平滑，花瓶表面明显更光滑
+      30 次：填洞后的推荐值，让新旧面自然衔接
       50 次：重度平滑，植物细节丢失但花瓶非常光滑
     """
     n_vert_before = len(mesh.vertices)
@@ -384,17 +438,23 @@ def main():
                         help="上采样法向量随机偏移比例（默认 0.1）")
 
     # 泊松参数
-    parser.add_argument("--poisson-depth", type=int, default=10,
-                        help="泊松深度（默认 10，比 Stage 5 的 9 更精细）")
-    parser.add_argument("--density-cut", type=float, default=0.10,
-                        help="低密度顶点裁剪比例（默认 0.10）")
-    parser.add_argument("--normal-radius", type=float, default=8.0,
-                        help="法向量估计半径 mm（默认 8）")
+    parser.add_argument("--poisson-depth", type=int, default=9,
+                        help="泊松深度（默认 9，越小越不容易出孔洞）")
+    parser.add_argument("--density-cut", type=float, default=0.02,
+                        help="低密度顶点裁剪比例（默认 0.02，只裁最底部 2%%）")
+    parser.add_argument("--normal-radius", type=float, default=12.0,
+                        help="法向量估计半径 mm（默认 12，越大越稳定）")
+
+    # 填洞参数
+    parser.add_argument("--fill-hole-size", type=int, default=500,
+                        help="填补孔洞的最大边界边长（默认 500）")
+    parser.add_argument("--no-fill", action="store_true",
+                        help="跳过孔洞填补")
 
     # Mesh 平滑参数
-    parser.add_argument("--taubin-iter", type=int, default=20,
-                        help="Taubin 平滑迭代次数（默认 20）"
-                             " 10=轻微 20=中度 50=重度")
+    parser.add_argument("--taubin-iter", type=int, default=30,
+                        help="Taubin 平滑迭代次数（默认 30）"
+                             " 10=轻微 20=中度 30=填洞推荐 50=重度")
     parser.add_argument("--no-taubin", action="store_true",
                         help="跳过 Taubin 平滑")
     parser.add_argument("--min-cluster-ratio", type=float, default=0.01,
@@ -406,12 +466,12 @@ def main():
     input_path = os.path.join(out_dir, args.source)
 
     if not os.path.isfile(input_path):
-        print(f"✗ 找不到输入文件: {input_path}")
+        print(f"找不到输入文件: {input_path}")
         print(f"  确认已经跑过 Stage 3 (06_stage3_register.py)")
         sys.exit(1)
 
     print("=" * 64)
-    print("后处理流水线：点云清洗 → 泊松重建 → Mesh 平滑")
+    print("后处理流水线：点云清洗 → 泊松重建 → 填洞 → Mesh 平滑")
     print("=" * 64)
     print(f"输入: {input_path}")
     print()
@@ -421,42 +481,42 @@ def main():
     pcd = o3d.io.read_point_cloud(input_path)
     print(f"  {len(pcd.points):,} 点")
     if len(pcd.points) < 1000:
-        print("✗ 点数太少，检查输入文件")
+        print("点数太少，检查输入文件")
         sys.exit(1)
 
     has_colors = len(np.asarray(pcd.colors)) > 0
     print(f"  颜色: {'有' if has_colors else '无'}")
     aabb = pcd.get_axis_aligned_bounding_box()
     sz = aabb.max_bound - aabb.min_bound
-    print(f"  包围盒: {sz[0]:.1f} × {sz[1]:.1f} × {sz[2]:.1f} mm")
+    print(f"  包围盒: {sz[0]:.1f} x {sz[1]:.1f} x {sz[2]:.1f} mm")
     print()
 
     # ---- Step 1: SOR ----
-    print("[Step 1/8] 统计离群点滤波（SOR）...")
+    print("[Step 1/9] 统计离群点滤波（SOR）...")
     pcd = step_sor(pcd, nb_neighbors=args.sor_k, std_ratio=args.sor_std)
     print()
 
     # ---- Step 2: ROR ----
-    print("[Step 2/8] 半径离群点滤波（ROR）...")
+    print("[Step 2/9] 半径离群点滤波（ROR）...")
     pcd = step_ror(pcd, nb_points=args.ror_min, radius=args.ror_radius)
     print()
 
     # ---- Step 3: 体素降采样 ----
-    print("[Step 3/8] 体素降采样...")
+    print("[Step 3/9] 体素降采样...")
     pcd = step_voxel(pcd, voxel_size=args.voxel)
     print()
 
     # ---- Step 4: RANSAC 去残留平面（可选）----
     if args.remove_plane:
-        print("[Step 4/8] RANSAC 去残留平面...")
+        print("[Step 4/9] RANSAC 去残留平面...")
         pcd = step_remove_plane(pcd)
     else:
-        print("[Step 4/8] 跳过 RANSAC（加 --remove-plane 开启）")
+        print("[Step 4/9] 跳过 RANSAC（加 --remove-plane 开启）")
     print()
 
     # ---- Step 5: 上采样（可选）----
     if args.upsample:
-        print("[Step 5/8] 上采样（增加点云密度）...")
+        print("[Step 5/9] 上采样（增加点云密度）...")
         pcd = step_upsample(pcd, neighbor_k=args.neighbor_k,
                             color_k=args.color_k, jitter=args.jitter)
         print()
@@ -468,25 +528,33 @@ def main():
     print(f"  最终点数: {len(pcd.points):,}")
     print()
 
-    # ---- Step 5: 泊松重建 ----
-    print("[Step 6/8] 泊松表面重建...")
+    # ---- Step 6: 泊松重建 ----
+    print("[Step 6/9] 泊松表面重建...")
     mesh = step_poisson(pcd,
                         depth=args.poisson_depth,
                         density_cut=args.density_cut,
                         normal_radius=args.normal_radius)
     print()
 
-    # ---- Step 7: Taubin 平滑 ----
+    # ---- Step 7: 填补孔洞 ----
+    if not args.no_fill:
+        print(f"[Step 7/9] 填补孔洞 (hole_size={args.fill_hole_size})...")
+        mesh = step_fill_holes(mesh, max_hole_size=args.fill_hole_size)
+    else:
+        print("[Step 7/9] 跳过填洞（--no-fill）")
+    print()
+
+    # ---- Step 8: Taubin 平滑 ----
     if not args.no_taubin:
-        print(f"[Step 7/8] Taubin 平滑（{args.taubin_iter} 次迭代）...")
+        print(f"[Step 8/9] Taubin 平滑（{args.taubin_iter} 次迭代）...")
         mesh = step_taubin(mesh, n_iter=args.taubin_iter)
     else:
-        print("[Step 7/8] 跳过 Taubin 平滑（--no-taubin）")
+        print("[Step 8/9] 跳过 Taubin 平滑（--no-taubin）")
         mesh.compute_vertex_normals()
     print()
 
-    # ---- Step 8: 删除孤立小面片 ----
-    print("[Step 8/8] 删除孤立小面片...")
+    # ---- Step 9: 删除孤立小面片 ----
+    print("[Step 9/9] 删除孤立小面片...")
     mesh = step_remove_small_clusters(mesh, min_triangle_ratio=args.min_cluster_ratio)
     print()
 
@@ -510,18 +578,21 @@ def main():
     print(f"  顶点: {len(mesh.vertices):,}")
     print(f"  面片: {len(mesh.triangles):,}")
     print(f"  水密: {'是' if mesh.is_watertight() else '否'}")
-    print(f"  尺寸: {sz2[0]:.1f} × {sz2[1]:.1f} × {sz2[2]:.1f} mm")
+    print(f"  尺寸: {sz2[0]:.1f} x {sz2[1]:.1f} x {sz2[2]:.1f} mm")
     print()
-    print(f"  → {obj_path}")
-    print(f"  → {stl_path}")
-    print(f"  → {ply_path}")
+    print(f"  -> {obj_path}")
+    print(f"  -> {stl_path}")
+    print(f"  -> {ply_path}")
     print()
     print("调参建议:")
-    print("  模型有很多漂浮点  → --sor-std 1.5（更激进）")
-    print("  边缘仍有飞点      → --ror-radius 8 --ror-min 8")
-    print("  表面还不够光滑    → --taubin-iter 30 或 50")
-    print("  细节丢失太多      → --taubin-iter 10 --no-taubin 或减小 --voxel")
-    print("  有转盘残留        → --remove-plane")
+    print("  孔洞很多          -> --density-cut 0.01 --poisson-depth 8")
+    print("  花盆区域有洞      -> --density-cut 0.01（保留更多低密度顶点）")
+    print("  填洞后不自然      -> --taubin-iter 50（更多平滑）")
+    print("  模型有很多漂浮点  -> --sor-std 1.5（更激进）")
+    print("  边缘仍有飞点      -> --ror-radius 8 --ror-min 8")
+    print("  表面还不够光滑    -> --taubin-iter 50")
+    print("  细节丢失太多      -> --taubin-iter 10 或减小 --voxel")
+    print("  有转盘残留        -> --remove-plane")
 
 
 if __name__ == "__main__":
