@@ -229,7 +229,7 @@ def pairwise_register(src, tgt, src_ds, tgt_ds, src_fpfh, tgt_fpfh,
 # ============================================================
 
 def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
-                     deg_per_frame=None, rotation_center=None):
+                     deg_per_frame=None, rotation_center=None, loop_weight=10.0):
     """构建 pose graph，用角度初值解决 ICP 卡在局部最优的问题"""
     n = len(pcds_data)
     pose_graph = o3d.pipelines.registration.PoseGraph()
@@ -286,7 +286,7 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
                   f"angle={angle_out:.2f}°  {log.get('init_source','')}  {status}")
 
     # ---- 跳跃边 ----
-    print(f"\n  构建跳跃边 (i <-> i+2)...")
+    print(f"\n  构建跳跃边 (i ↔ i+2)...")
     for i in range(n - 2):
         src_data = pcds_data[i + 2]
         tgt_data = pcds_data[i]
@@ -305,7 +305,7 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
                     i + 2, i, T, info, uncertain=True))
 
     # ---- 闭环边 ----
-    print(f"\n  构建闭环边...")
+    print(f"\n  构建闭环边（强化权重 ×{loop_weight}）...")
     pairs = [(0, n - 1), (0, n // 2)]
     if loop_closures > 2:
         pairs.append((n // 4, 3 * n // 4))
@@ -327,12 +327,16 @@ def build_pose_graph(pcds_data, voxel, loop_closures=2, use_color_icp=True,
                     "status": "OK" if success else "FAIL"})
         edges_log.append(log)
         if success:
+            # 闭环边信息矩阵乘以 loop_weight：强制全局优化把首尾对齐
+            # loop_weight 越大，首尾重合越严格，但其他边的形变也越大
+            # 推荐 5-20；极端情况可以 50
+            info_boosted = info * loop_weight
             pose_graph.edges.append(
                 o3d.pipelines.registration.PoseGraphEdge(
-                    j, i, T, info, uncertain=True))
+                    j, i, T, info_boosted, uncertain=False))  # uncertain=False：强制约束
             angle_out = np.degrees(np.arccos(np.clip((np.trace(T[:3, :3]) - 1) / 2, -1, 1)))
             print(f"    闭环 ({i},{j})  fit={log.get('color_fitness',0):.2f}  "
-                  f"angle={angle_out:.2f}°  OK")
+                  f"angle={angle_out:.2f}°  OK（权重×{loop_weight}）")
         else:
             print(f"    闭环 ({i},{j})  fit={log.get('color_fitness',0):.2f}  FAIL")
 
@@ -356,37 +360,6 @@ def optimize_pose_graph(pose_graph, voxel):
 
 
 # ============================================================
-#  找到一圈的位置
-# ============================================================
-
-def compute_similarity(pcd1, pcd2):
-    """计算两个点云的相似度（基于质心距离和大小）"""
-    pts1 = np.asarray(pcd1.points)
-    pts2 = np.asarray(pcd2.points)
-    centroid1 = pts1.mean(axis=0)
-    centroid2 = pts2.mean(axis=0)
-    centroid_dist = np.linalg.norm(centroid2 - centroid1)
-    size_diff = abs(len(pts1) - len(pts2)) / max(len(pts1), len(pts2))
-    return centroid_dist + size_diff * 100
-
-
-def find_one_turn(pcd_files, search_start=100, search_end=150):
-    """找到转完一圈的帧索引（对比第一帧）"""
-    ref_pcd = o3d.io.read_point_cloud(pcd_files[0])
-    best_similarity = float('inf')
-    best_frame = search_start
-
-    for i in range(search_start, min(search_end, len(pcd_files))):
-        pcd = o3d.io.read_point_cloud(pcd_files[i])
-        sim = compute_similarity(ref_pcd, pcd)
-        if sim < best_similarity:
-            best_similarity = sim
-            best_frame = i
-
-    return best_frame
-
-
-# ============================================================
 #  主流程
 # ============================================================
 
@@ -395,22 +368,14 @@ def main():
     parser.add_argument("--input", required=True)
     parser.add_argument("--voxel", type=float, default=8.0)
     parser.add_argument("--loop-closures", type=int, default=3)
-    parser.add_argument("--no-color-icp", action="store_true")
+    parser.add_argument("--loop-weight", type=float, default=10.0,
+                        help="闭环边权重倍数（默认 10）。越大首尾越严格重合，"
+                             "但局部形变也越大。范围 5-50。")
     parser.add_argument("--output", default=None)
     parser.add_argument("--deg-per-frame", type=float, default=None,
                         help="每帧旋转角度（度）。不指定时从 metadata.json 自动算")
     parser.add_argument("--rotation-center", type=float, nargs=3, default=None,
                         help="旋转中心 (x y z) mm。不指定时用原点")
-    parser.add_argument("--search-start", type=int, default=100,
-                        help="搜索一圈位置的起始帧 (默认 100)")
-    parser.add_argument("--search-end", type=int, default=150,
-                        help="搜索一圈位置的结束帧 (默认 150)")
-    parser.add_argument("--full-turns", type=int, default=1,
-                        help="使用几圈 (默认 1)")
-    parser.add_argument("--sample-ratio", type=float, default=1.0,
-                        help="在一圈内抽帧比例 (默认 1.0，不抽帧)")
-    parser.add_argument("--frame-range", type=int, nargs=2, default=None,
-                        help="手动指定帧范围 start end (如 --frame-range 5 123)")
     args = parser.parse_args()
 
     print("=" * 64)
@@ -461,33 +426,12 @@ def main():
     out_dir = args.output or os.path.join(args.input, "output_v2")
     os.makedirs(out_dir, exist_ok=True)
 
-    # ---- 找到一圈并限制帧数 ----
+    # ---- 加载所有点云 ----
+    print("[1/4] 加载点云 + 预处理...")
     pcd_files = sorted(glob.glob(os.path.join(pcds_dir, "*.ply")))
     if len(pcd_files) < 3:
         print(f"✗ 帧数太少 ({len(pcd_files)})")
         sys.exit(1)
-
-    one_turn_frame = find_one_turn(pcd_files, args.search_start, args.search_end)
-
-    if args.frame_range:
-        start_f, end_f = args.frame_range
-        pcd_files = [f for f in pcd_files
-                     if start_f <= int(os.path.splitext(os.path.basename(f))[0]) <= end_f]
-        print(f"  手动帧范围: {start_f}-{end_f} = {len(pcd_files)} 帧")
-    else:
-        n_frames_per_turn = one_turn_frame
-        frames_to_use = min(args.full_turns, 2) * n_frames_per_turn
-        pcd_files = pcd_files[:frames_to_use]
-        print(f"  一圈 = {n_frames_per_turn} 帧, 使用 {args.full_turns} 圈 = {len(pcd_files)} 帧")
-
-    if args.sample_ratio < 1.0:
-        n_samples = max(3, int(len(pcd_files) * args.sample_ratio))
-        sample_indices = np.linspace(0, len(pcd_files) - 1, n_samples, dtype=int)
-        pcd_files = [pcd_files[i] for i in sample_indices]
-        print(f"  抽帧: {n_samples} 帧 (比例 {args.sample_ratio*100:.0f}%)")
-
-    # ---- 加载点云 ----
-    print("\n[1/4] 加载点云 + 预处理...")
 
     pcds_data = []
     t0 = time.time()
@@ -519,6 +463,7 @@ def main():
         use_color_icp=not args.no_color_icp,
         deg_per_frame=deg_per_frame,
         rotation_center=rotation_center,
+        loop_weight=args.loop_weight,
     )
     print(f"  节点 {len(pose_graph.nodes)}, 边 {len(pose_graph.edges)}  "
           f"耗时 {time.time()-t0:.1f}s")
