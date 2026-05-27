@@ -2,7 +2,7 @@
 
 使用 Kinect v2 深度相机 + 电动转盘拍摄盆栽，自动生成 360° 3D 模型。
 
-## 流水线 (5 Stages)
+## 流水线 (6 Stages)
 
 | Stage | 脚本 | 功能 |
 |-------|------|------|
@@ -11,8 +11,7 @@
 | 1 | `04_stage1_pcd_v5.py` | 深度图→彩色点云，去除背景/地面 |
 | 2 | `05_stage2_segment_v3.py` | 裁剪出黑色转盘以上的盆栽 |
 | 3 | `06_stage3_register.py` | 多帧配准 (Pose Graph + Color ICP) |
-| 4 | `07_stage4_align.py` | 对齐到坐标轴 |
-| 5 | `08_stage5_mesh.py` | 泊松网格重建 |
+| 9 | `09_postprocess.py` | 7步后处理: SOR+ROR+降采样+泊松+Taubin+上采样+颜色重采样 |
 
 ## Stage 3 核心修复 (最重要)
 
