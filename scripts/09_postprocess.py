@@ -97,6 +97,191 @@ def step_voxel(pcd, voxel_size=2.0):
     return pcd_down
 
 
+def step_upsample(pcd, voxel_size=2.0, target_points=None):
+    """
+    上采样：在每个体素内插值新点，增加点云密度。
+
+    原理：
+    1. 对每个体素内的点，计算质心
+    2. 在质心附近随机生成新点（沿法向量方向偏移）
+    3. 新点继承原有点的颜色（插值）
+
+    voxel_size: 体素尺寸 mm（越小插值点越多）
+    target_points: 目标点数（如果指定，自动调整插倍数）
+    """
+    n_before = len(pcd.points)
+
+    # 计算法向量（用于插值方向）
+    pcd.estimate_normals(
+        o3d.geometry.KDTreeSearchParamHybrid(radius=voxel_size * 2, max_nn=30))
+
+    # 体素化
+    voxel_grid = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size)
+
+    # 获取每个体素内的点
+    pts = np.asarray(pcd.points)
+    colors = np.asarray(pcd.colors) if len(np.asarray(pcd.colors)) > 0 else None
+    normals = np.asarray(pcd.normals) if len(np.asarray(pcd.normals)) > 0 else None
+
+    # 计算每个点所属的体素索引
+    voxel_indices = {}
+    for i, pt in enumerate(pts):
+        voxel_idx = tuple(((pt - voxel_grid.origin) / voxel_size).astype(int))
+        if voxel_idx not in voxel_indices:
+            voxel_indices[voxel_idx] = []
+        voxel_indices[voxel_idx].append(i)
+
+    # 在每个体素内插值新点
+    new_points = []
+    new_colors = []
+    for voxel_idx, point_indices in voxel_indices.items():
+        if len(point_indices) < 2:
+            continue
+
+        # 获取体素内的点
+        voxel_pts = pts[point_indices]
+        centroid = voxel_pts.mean(axis=0)
+
+        # 计算体素内点的标准差（用于控制插值范围）
+        std = voxel_pts.std(axis=0).mean()
+
+        # 在质心附近生成新点（沿法向量方向）
+        if normals is not None:
+            voxel_normals = normals[point_indices]
+            avg_normal = voxel_normals.mean(axis=0)
+            avg_normal = avg_normal / np.linalg.norm(avg_normal)
+
+            # 在法向量方向上插值
+            for _ in range(2):  # 每个体素插值 2 个点
+                offset = np.random.uniform(-std, std)
+                new_pt = centroid + offset * avg_normal
+                new_points.append(new_pt)
+
+                # 颜色插值（取最近的原有点的颜色）
+                if colors is not None:
+                    dists = np.linalg.norm(voxel_pts - new_pt, axis=1)
+                    nearest_idx = point_indices[np.argmin(dists)]
+                    new_colors.append(colors[nearest_idx])
+
+    # 合并新点和原有点
+    if new_points:
+        all_points = np.vstack([pts, np.array(new_points)])
+        if colors is not None and new_colors:
+            all_colors = np.vstack([colors, np.array(new_colors)])
+        else:
+            all_colors = colors
+
+        pcd_upsampled = o3d.geometry.PointCloud()
+        pcd_upsampled.points = o3d.utility.Vector3dVector(all_points)
+        if all_colors is not None:
+            pcd_upsampled.colors = o3d.utility.Vector3dVector(all_colors)
+        if normals is not None:
+            pcd_upsampled.normals = o3d.utility.Vector3dVector(
+                np.vstack([normals, np.zeros((len(new_points), 3))]))
+    else:
+        pcd_upsampled = pcd
+
+    n_after = len(pcd_upsampled.points)
+    print(f"  上采样 (voxel={voxel_size}mm): "
+          f"{n_before:,} → {n_after:,} 点 (+{n_after-n_before:,})")
+    return pcd_upsampled
+
+
+def step_recolor_from_images(pcd, input_dir, poses, calib, max_dist=3000):
+    """
+    从原始照片重新采样颜色。
+
+    原理：
+    1. 读取每帧的对齐照片（aligned/XXXX.png）
+    2. 用位姿将点云变换到每帧的相机坐标系
+    3. 用相机内参投影到图像平面
+    4. 从图像中采样颜色
+    5. 对每个点，取所有可见帧的颜色加权平均（距离越近权重越大）
+
+    pcd: 点云
+    input_dir: capture 目录
+    poses: 位姿列表 [{'id': 5, 'pose': 4x4}, ...]
+    calib: 标定数据
+    max_dist: 最大深度 mm（超过的点不采样）
+    """
+    import cv2
+
+    pts = np.asarray(pcd.points)
+    n_points = len(pts)
+
+    # 相机内参
+    color_K = np.array(calib['color']['K'])
+    fx, fy = color_K[0, 0], color_K[1, 1]
+    cx, cy = color_K[0, 2], color_K[1, 2]
+
+    # 累积颜色和权重
+    color_sum = np.zeros((n_points, 3))
+    weight_sum = np.zeros(n_points)
+
+    aligned_dir = os.path.join(input_dir, "aligned")
+
+    for pose_data in poses:
+        frame_id = pose_data['id']
+        T = np.array(pose_data['pose'])  # 4x4 位姿矩阵
+
+        # 读取对齐照片
+        img_path = os.path.join(aligned_dir, f"{frame_id:04d}.png")
+        if not os.path.isfile(img_path):
+            continue
+
+        img = cv2.imread(img_path)
+        if img is None:
+            continue
+
+        # 将点云变换到该帧的相机坐标系
+        # 注意：poses 是从世界到相机的变换，需要取逆
+        T_inv = np.linalg.inv(T)
+        pts_cam = (T_inv[:3, :3] @ pts.T + T_inv[:3, 3:]).T
+
+        # 投影到图像平面
+        u = (pts_cam[:, 0] * fx / pts_cam[:, 2] + cx).astype(int)
+        v = (pts_cam[:, 1] * fy / pts_cam[:, 2] + cy).astype(int)
+
+        # 过滤有效投影（在图像范围内且深度合理）
+        h, w = img.shape[:2]
+        valid = (u >= 0) & (u < w) & (v >= 0) & (v < h) & \
+                (pts_cam[:, 2] > 0) & (pts_cam[:, 2] < max_dist)
+
+        if not np.any(valid):
+            continue
+
+        # 采样颜色（BGR → RGB，归一化到 0-1）
+        sampled_bgr = img[v[valid], u[valid]]
+        sampled_rgb = sampled_bgr[:, ::-1].astype(float) / 255.0
+
+        # 权重：基于深度（越近权重越大）
+        depth = pts_cam[valid, 2]
+        weight = 1.0 / (depth / 1000.0)  # 归一化到米
+
+        # 累积
+        color_sum[valid] += sampled_rgb * weight[:, np.newaxis]
+        weight_sum[valid] += weight
+
+    # 计算加权平均颜色
+    valid_points = weight_sum > 0
+    if not np.any(valid_points):
+        print("  警告：没有点被成功采样颜色")
+        return pcd
+
+    colors = np.zeros((n_points, 3))
+    colors[valid_points] = color_sum[valid_points] / weight_sum[valid_points, np.newaxis]
+
+    # 对没有被采样的点，保留原颜色
+    if len(np.asarray(pcd.colors)) > 0:
+        colors[~valid_points] = np.asarray(pcd.colors)[~valid_points]
+
+    pcd.colors = o3d.utility.Vector3dVector(colors)
+    print(f"  颜色重采样: {valid_points.sum():,}/{n_points:,} 点被更新 "
+          f"({valid_points.sum()/n_points*100:.1f}%)")
+
+    return pcd
+
+
 def step_remove_plane(pcd, dist_threshold=8.0, min_plane_ratio=0.05):
     """
     RANSAC 去除残留水平平面（Stage 2 没去干净的转盘/桌面）。
@@ -278,6 +463,14 @@ def main():
     parser.add_argument("--remove-plane", action="store_true",
                         help="启用 RANSAC 去残留平面（默认关）")
 
+    # 上采样和颜色重采样参数
+    parser.add_argument("--upsample", action="store_true",
+                        help="启用上采样（增加点云密度）")
+    parser.add_argument("--upsample-voxel", type=float, default=1.0,
+                        help="上采样体素 mm（默认 1.0，越小插值点越多）")
+    parser.add_argument("--recolor", action="store_true",
+                        help="从原始照片重新采样颜色（需要 aligned/ 目录）")
+
     # 泊松参数
     parser.add_argument("--poisson-depth", type=int, default=10,
                         help="泊松深度（默认 10，比 Stage 5 的 9 更精细）")
@@ -348,6 +541,30 @@ def main():
     else:
         print("[Step 4/7] 跳过 RANSAC（加 --remove-plane 开启）")
     print()
+
+    # ---- Step 4b: 上采样（可选）----
+    if args.upsample:
+        print("[Step 4b] 上采样（增加点云密度）...")
+        pcd = step_upsample(pcd, voxel_size=args.upsample_voxel)
+        print()
+
+    # ---- Step 4c: 颜色重采样（可选）----
+    if args.recolor:
+        print("[Step 4c] 从原始照片重新采样颜色...")
+        import json as _json
+        poses_path = os.path.join(out_dir, "poses.json")
+        calib_path = os.path.join(args.input, "..", "calib_imgs", "calibration.json")
+        if not os.path.isfile(calib_path):
+            calib_path = os.path.join("calib_imgs", "calibration.json")
+        if os.path.isfile(poses_path) and os.path.isfile(calib_path):
+            with open(poses_path) as f:
+                poses = _json.load(f)
+            with open(calib_path) as f:
+                calib = _json.load(f)
+            pcd = step_recolor_from_images(pcd, args.input, poses, calib)
+        else:
+            print("  警告：找不到 poses.json 或 calibration.json，跳过颜色重采样")
+        print()
 
     # 保存清洗后的点云（方便调试）
     clean_pcd_path = os.path.join(out_dir, "pcd_postprocessed.ply")
